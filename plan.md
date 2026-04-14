@@ -27,7 +27,7 @@ src/
 4. **Implement a safetensors parser from scratch** (`safetensors.rs`) ✓
    The safetensors format starts with a little-endian u64 giving the header length, followed by a JSON header mapping tensor names to `{dtype, shape, data_offsets}`, followed by the raw tensor bytes. Parse the header with `serde_json`, then for each tensor slice the byte buffer at `data_offsets`, reinterpret the bytes as `f32` (casting from the bf16 or f16 on-disk dtype if needed), and reshape into an `ndarray::ArrayD<f32>`. Build a `Weights` struct with named fields (`embed_tokens`, per-layer `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`, `input_layernorm`, `post_attention_layernorm`, `norm`, `lm_head`) so the transformer code can access them by name.
 
-5. **Implement a BPE tokenizer from scratch** (`tokenizer.rs`)
+5. **Implement a BPE tokenizer from scratch** (`tokenizer.rs`) ✓
    Parse `tokenizer.json` with serde to extract the vocabulary (`token → id` map) and the BPE merge list (ordered list of `(left, right)` string pairs). To encode: pre-tokenize the input text using the Qwen regex pattern (splits on whitespace, punctuation, and digits), represent each pre-token as a sequence of UTF-8 bytes mapped to single-byte vocab entries, then repeatedly apply the highest-priority merge from the merge list until no more merges are possible (standard BPE). To decode: look up each id in the reverse vocab map (`id → token`), concatenate, and interpret as UTF-8. Also read `bos_token_id`, `eos_token_id`, and `pad_token_id` from `tokenizer_config.json`. Expose `encode(text) -> Vec<u32>` and `decode(ids) -> String`.
 
 6. **Implement transformer building blocks** (`transformer.rs`)

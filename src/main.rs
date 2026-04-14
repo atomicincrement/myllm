@@ -1,6 +1,7 @@
 mod config;
 mod download;
 mod safetensors;
+mod tokenizer;
 
 const MODEL_REPO: &str = "Qwen/Qwen2.5-0.5B-Instruct";
 
