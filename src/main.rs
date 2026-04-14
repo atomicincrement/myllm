@@ -15,5 +15,13 @@ fn main() -> anyhow::Result<()> {
         weights.norm.dim(),
         weights.layers.len()
     );
+
+    let tok = tokenizer::Tokenizer::from_dir(&cache_dir, cfg.bos_token_id, cfg.eos_token_id)?;
+    let text = "hello world";
+    let ids = tok.encode(text)?;
+    println!("encode({text:?}) = {ids:?}");
+    let decoded = tok.decode(&ids);
+    println!("decode({ids:?}) = {decoded:?}");
+
     Ok(())
 }

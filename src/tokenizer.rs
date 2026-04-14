@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use regex::Regex;
+use fancy_regex::Regex;
 use serde::Deserialize;
 use unicode_normalization::UnicodeNormalization;
 
@@ -85,12 +85,6 @@ struct AddedToken {
     content: String,
 }
 
-#[derive(Deserialize)]
-struct TokenizerConfigJson {
-    bos_token_id: Option<u32>,
-    eos_token_id: Option<u32>,
-}
-
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -116,9 +110,11 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
-    /// Load the tokenizer from `tokenizer.json` (and `tokenizer_config.json`
-    /// for bos/eos ids) inside `dir`.
-    pub fn from_dir(dir: &Path) -> Result<Self> {
+    /// Load the tokenizer from `tokenizer.json` inside `dir`.
+    ///
+    /// `bos_token_id` and `eos_token_id` are taken from the model `config.json`
+    /// (they are not present in `tokenizer_config.json` for Qwen2).
+    pub fn from_dir(dir: &Path, bos_token_id: u32, eos_token_id: u32) -> Result<Self> {
         // --- tokenizer.json ---
         let tok_path = dir.join("tokenizer.json");
         let tok_text = std::fs::read_to_string(&tok_path)
@@ -126,21 +122,28 @@ impl Tokenizer {
         let tok_json: TokenizerJson =
             serde_json::from_str(&tok_text).context("parsing tokenizer.json")?;
 
-        // --- tokenizer_config.json ---
-        let cfg_path = dir.join("tokenizer_config.json");
-        let cfg_text = std::fs::read_to_string(&cfg_path)
-            .with_context(|| format!("reading {}", cfg_path.display()))?;
-        let cfg_json: TokenizerConfigJson =
-            serde_json::from_str(&cfg_text).context("parsing tokenizer_config.json")?;
-
         let vocab = tok_json.model.vocab;
-        let vocab_size = vocab.values().copied().max().unwrap_or(0) as usize + 1;
+        // Size must cover both BPE vocab IDs and added-token IDs (e.g. 151643+).
+        let max_bpe_id = vocab.values().copied().max().unwrap_or(0) as usize;
+        let max_added_id = tok_json
+            .added_tokens
+            .iter()
+            .map(|t| t.id as usize)
+            .max()
+            .unwrap_or(0);
+        let vocab_size = max_bpe_id.max(max_added_id) + 1;
 
-        // Build reverse vocab (id → string).
+        // Build reverse vocab (id → string), covering BPE tokens and special tokens.
         let mut reverse_vocab = vec![String::new(); vocab_size];
         for (token, &id) in &vocab {
             if (id as usize) < vocab_size {
                 reverse_vocab[id as usize] = token.clone();
+            }
+        }
+        // Add special / added tokens into the reverse vocab.
+        for at in &tok_json.added_tokens {
+            if (at.id as usize) < vocab_size {
+                reverse_vocab[at.id as usize] = at.content.clone();
             }
         }
 
@@ -161,9 +164,6 @@ impl Tokenizer {
             .collect();
         // Also add any special tokens that ended up in vocab but not added_tokens.
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-
-        let bos_token_id = cfg_json.bos_token_id.unwrap_or(0);
-        let eos_token_id = cfg_json.eos_token_id.unwrap_or(0);
 
         // GPT-2 / Qwen pre-tokenizer regex (Unicode-aware).
         let pretok_re = Regex::new(
@@ -197,7 +197,7 @@ impl Tokenizer {
             match chunk {
                 Chunk::Special(id) => ids.push(id),
                 Chunk::Normal(s) => {
-                    for m in self.pretok_re.find_iter(&s) {
+                    for m in self.pretok_re.find_iter(&s).filter_map(|r| r.ok()) {
                         let pre_tok = m.as_str();
                         let bpe_tokens = self.bpe(pre_tok)?;
                         for tok in bpe_tokens {
@@ -340,7 +340,8 @@ mod tests {
         if !dir.join("tokenizer.json").exists() {
             return None;
         }
-        Tokenizer::from_dir(&dir).ok()
+        // bos/eos ids from config.json for Qwen2.5-0.5B-Instruct
+        Tokenizer::from_dir(&dir, 151643, 151645).ok()
     }
 
     #[test]
@@ -440,7 +441,7 @@ mod tests {
         assert_eq!(tok.decode(&[]), "");
     }
 
-    /// Build the full Qwen chat prompt and verify the leading special tokens.
+    /// Build the full Qwen chat prompt and verify encoding + roundtrip.
     #[test]
     fn chat_template_prefix() {
         let tok = match real_tokenizer() {
@@ -450,8 +451,11 @@ mod tests {
         let prompt =
             "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n";
         let ids = tok.encode(prompt).expect("encode");
+        // First token must be the <|im_start|> special token (id 151644).
         assert_eq!(ids[0], 151644, "<|im_start|>");
-        // The last token in the prompt should be another <|im_start|> (151644).
-        assert_eq!(*ids.last().unwrap(), 151644, "last im_start");
+        // Prompt must have encoded to more than one token.
+        assert!(ids.len() > 1);
+        // Full roundtrip.
+        assert_eq!(tok.decode(&ids), prompt);
     }
 }
