@@ -15,8 +15,8 @@ src/
 
 ## Steps
 
-1. **Add dependencies to Cargo.toml**
-   Add `ndarray` (n-dimensional arrays), `reqwest` (HTTP, blocking + rustls-tls features), `serde`/`serde_json` (JSON deserialisation), `safetensors` (weight file format), and `tokenizers` (HuggingFace fast tokenizer). Also add `indicatif` for download progress bars and `anyhow` for ergonomic error handling.
+1. **Add dependencies to Cargo.toml** ✓
+   `ndarray` (n-dimensional arrays), `reqwest` (HTTP, blocking + rustls features), `serde`/`serde_json` (JSON deserialisation), `anyhow` (error handling). The safetensors parser and BPE tokenizer are implemented from scratch with no external crates.
 
 2. **Fetch the Qwen model files over HTTP** (`download.rs`)
    Download `config.json`, `tokenizer.json`, `tokenizer_config.json`, and `model.safetensors` (or sharded `model-00001-of-NNNNN.safetensors` files) from the Hugging Face Hub using reqwest. Cache files to a local directory so they are not re-downloaded on subsequent runs. Verify file sizes / checksums against the Hub metadata.
@@ -24,11 +24,11 @@ src/
 3. **Parse the model config** (`config.rs`)
    Deserialise `config.json` into a `ModelConfig` struct using serde. Key fields: `vocab_size`, `hidden_size`, `intermediate_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads` (for GQA), `max_position_embeddings`, `rms_norm_eps`, `rope_theta`. This struct is passed to every other module so dimensions are consistent.
 
-4. **Load model weights from safetensors** (`safetensors.rs`)
-   Memory-map the `.safetensors` file(s) and deserialise each tensor into an `ndarray::ArrayD<f32>`. Build a `Weights` struct with named fields (e.g. `embed_tokens`, per-layer `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`, `input_layernorm`, `post_attention_layernorm`, `norm`, `lm_head`) so the transformer code can access them by name rather than by string key.
+4. **Implement a safetensors parser from scratch** (`safetensors.rs`)
+   The safetensors format starts with a little-endian u64 giving the header length, followed by a JSON header mapping tensor names to `{dtype, shape, data_offsets}`, followed by the raw tensor bytes. Parse the header with `serde_json`, then for each tensor slice the byte buffer at `data_offsets`, reinterpret the bytes as `f32` (casting from the bf16 or f16 on-disk dtype if needed), and reshape into an `ndarray::ArrayD<f32>`. Build a `Weights` struct with named fields (`embed_tokens`, per-layer `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`, `input_layernorm`, `post_attention_layernorm`, `norm`, `lm_head`) so the transformer code can access them by name.
 
-5. **Implement the tokenizer** (`tokenizer.rs`)
-   Wrap the HuggingFace `tokenizers` crate to load `tokenizer.json`. Expose `encode(text) -> Vec<u32>` and `decode(ids) -> String`. Also expose constants for special token ids: `bos_token_id`, `eos_token_id`, `pad_token_id`. The Qwen tokenizer uses a custom BPE vocabulary; the `tokenizers` crate handles this transparently.
+5. **Implement a BPE tokenizer from scratch** (`tokenizer.rs`)
+   Parse `tokenizer.json` with serde to extract the vocabulary (`token → id` map) and the BPE merge list (ordered list of `(left, right)` string pairs). To encode: pre-tokenize the input text using the Qwen regex pattern (splits on whitespace, punctuation, and digits), represent each pre-token as a sequence of UTF-8 bytes mapped to single-byte vocab entries, then repeatedly apply the highest-priority merge from the merge list until no more merges are possible (standard BPE). To decode: look up each id in the reverse vocab map (`id → token`), concatenate, and interpret as UTF-8. Also read `bos_token_id`, `eos_token_id`, and `pad_token_id` from `tokenizer_config.json`. Expose `encode(text) -> Vec<u32>` and `decode(ids) -> String`.
 
 6. **Implement transformer building blocks** (`transformer.rs`)
    * **RMS layer normalization** — normalize each vector by its root-mean-square, then scale by a learned weight vector. No bias, no mean subtraction (unlike LayerNorm).
