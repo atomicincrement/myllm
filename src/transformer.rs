@@ -1,12 +1,16 @@
 //! Transformer building blocks for Qwen2.
 //!
-//! Implemented so far:
-//! * [`rms_norm`]  — Root-Mean-Square layer normalisation
-//! * [`RopeCache`] — precomputed cosine / sine tables for Rotary Positional Embeddings
+//! * [`rms_norm`]       — Root-Mean-Square layer normalisation
+//! * [`RopeCache`]      — precomputed cosine / sine tables for RoPE
+//! * [`attention`]      — grouped-query attention with KV cache
+//! * [`mlp`]            — SwiGLU feed-forward network
+//! * [`InferenceState`] — per-session KV cache
+//! * [`forward`]        — full Qwen2 forward pass
 
-use ndarray::{Array1, Array2, Array3, ArrayView1};
+use ndarray::{concatenate, Array1, Array2, Array3, ArrayView1, Axis};
 
 use crate::config::ModelConfig;
+use crate::safetensors::{LayerWeights, Weights};
 
 // ---------------------------------------------------------------------------
 // RMS layer normalisation
@@ -126,6 +130,268 @@ impl RopeCache {
         }
         out
     }
+}
+
+// ---------------------------------------------------------------------------
+// KV cache
+// ---------------------------------------------------------------------------
+
+/// Per-layer key/value cache for autoregressive generation.
+pub struct KvCache {
+    /// Accumulated keys:   `[past_len, kv_heads, head_dim]`
+    pub k: Array3<f32>,
+    /// Accumulated values: `[past_len, kv_heads, head_dim]`
+    pub v: Array3<f32>,
+}
+
+impl KvCache {
+    pub fn new(kv_heads: usize, head_dim: usize) -> Self {
+        KvCache {
+            k: Array3::zeros((0, kv_heads, head_dim)),
+            v: Array3::zeros((0, kv_heads, head_dim)),
+        }
+    }
+}
+
+/// All per-layer KV caches for one inference session.
+pub struct InferenceState {
+    pub kv_caches: Vec<KvCache>,
+}
+
+impl InferenceState {
+    pub fn new(cfg: &ModelConfig) -> Self {
+        InferenceState {
+            kv_caches: (0..cfg.num_hidden_layers)
+                .map(|_| KvCache::new(cfg.num_key_value_heads, cfg.head_dim()))
+                .collect(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Linear projection helper
+// ---------------------------------------------------------------------------
+
+/// `y = x @ weight.T  [+ bias]`
+///
+/// * `x`      — `[seq, in_features]`
+/// * `weight` — `[out_features, in_features]`
+/// * `bias`   — optional `[out_features]`
+fn linear(x: &Array2<f32>, weight: &Array2<f32>, bias: Option<&Array1<f32>>) -> Array2<f32> {
+    let mut out = x.dot(&weight.t()); // [seq, out_features]
+    if let Some(b) = bias {
+        for mut row in out.rows_mut() {
+            row += b;
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Activation / softmax helpers
+// ---------------------------------------------------------------------------
+
+/// Sigmoid-weighted linear unit: `x * σ(x)`.
+#[inline]
+fn silu(x: f32) -> f32 {
+    x * (1.0 / (1.0 + (-x).exp()))
+}
+
+/// In-place row softmax (numerically stable).
+fn softmax_1d(mut row: ndarray::ArrayViewMut1<f32>) {
+    let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    row.mapv_inplace(|v| (v - max).exp());
+    let sum = row.sum();
+    row.mapv_inplace(|v| v / sum);
+}
+
+// ---------------------------------------------------------------------------
+// Grouped-query attention (GQA)
+// ---------------------------------------------------------------------------
+
+/// Multi-head grouped-query attention for one transformer layer.
+///
+/// New K/V entries are appended to `kv_cache` in place so subsequent decode
+/// calls can reuse them.
+///
+/// # Arguments
+/// * `x`         — pre-norm hidden states `[seq, hidden_size]`
+/// * `layer`     — weight tensors for this layer
+/// * `rope`      — precomputed RoPE cosine / sine tables
+/// * `kv_cache`  — KV cache; extended in-place
+/// * `start_pos` — number of tokens already in the cache (= past length)
+/// * `cfg`       — model configuration
+pub fn attention(
+    x: &Array2<f32>,
+    layer: &LayerWeights,
+    rope: &RopeCache,
+    kv_cache: &mut KvCache,
+    start_pos: usize,
+    cfg: &ModelConfig,
+) -> Array2<f32> {
+    let (seq, _hidden) = x.dim();
+    let q_heads = cfg.num_attention_heads;
+    let kv_heads = cfg.num_key_value_heads;
+    let head_dim = cfg.head_dim();
+    let groups = q_heads / kv_heads; // 7 for Qwen2.5-0.5B
+
+    // Linear projections ---------------------------------------------------
+    let q_flat = linear(x, &layer.q_proj_weight, Some(&layer.q_proj_bias));
+    let k_flat = linear(x, &layer.k_proj_weight, Some(&layer.k_proj_bias));
+    let v_flat = linear(x, &layer.v_proj_weight, Some(&layer.v_proj_bias));
+
+    // Reshape to [seq, heads, head_dim] ------------------------------------
+    let q3 = q_flat
+        .into_shape_with_order((seq, q_heads, head_dim))
+        .expect("Q reshape");
+    let k3 = k_flat
+        .into_shape_with_order((seq, kv_heads, head_dim))
+        .expect("K reshape");
+    let v3 = v_flat
+        .into_shape_with_order((seq, kv_heads, head_dim))
+        .expect("V reshape");
+
+    // Apply RoPE to Q and K ------------------------------------------------
+    let q3 = rope.apply(&q3, start_pos);
+    let k3 = rope.apply(&k3, start_pos);
+
+    // Extend KV cache -------------------------------------------------------
+    kv_cache.k = concatenate(Axis(0), &[kv_cache.k.view(), k3.view()])
+        .expect("K concat");
+    kv_cache.v = concatenate(Axis(0), &[kv_cache.v.view(), v3.view()])
+        .expect("V concat");
+
+    let total = kv_cache.k.dim().0; // start_pos + seq
+
+    // Scaled dot-product attention with causal mask ------------------------
+    let scale = (head_dim as f32).sqrt().recip();
+    let mut attn_out = Array3::<f32>::zeros((seq, q_heads, head_dim));
+
+    for h in 0..q_heads {
+        let kv_h = h / groups; // which KV head this Q maps to
+
+        // scores[s, t] = Q[s,h,:] · K[t,kv_h,:] / sqrt(head_dim)
+        let mut scores = Array2::<f32>::zeros((seq, total));
+        for s in 0..seq {
+            for t in 0..total {
+                let dot: f32 = (0..head_dim)
+                    .map(|d| q3[[s, h, d]] * kv_cache.k[[t, kv_h, d]])
+                    .sum();
+                scores[[s, t]] = dot * scale;
+            }
+        }
+
+        // Apply causal mask: future positions → −∞
+        for s in 0..seq {
+            let visible_up_to = start_pos + s; // inclusive
+            for t in (visible_up_to + 1)..total {
+                scores[[s, t]] = f32::NEG_INFINITY;
+            }
+            softmax_1d(scores.row_mut(s));
+        }
+
+        // Weighted sum over values
+        for s in 0..seq {
+            for d in 0..head_dim {
+                let val: f32 = (0..total)
+                    .map(|t| scores[[s, t]] * kv_cache.v[[t, kv_h, d]])
+                    .sum();
+                attn_out[[s, h, d]] = val;
+            }
+        }
+    }
+
+    // Flatten heads back to [seq, q_heads * head_dim] and project ----------
+    let out_flat = attn_out
+        .into_shape_with_order((seq, q_heads * head_dim))
+        .expect("attn flatten");
+    linear(&out_flat, &layer.o_proj_weight, None)
+}
+
+// ---------------------------------------------------------------------------
+// SwiGLU MLP
+// ---------------------------------------------------------------------------
+
+/// SwiGLU feed-forward network:
+/// ```text
+/// gate = silu(x @ gate_proj.T)
+/// up   = x @ up_proj.T
+/// out  = (gate * up) @ down_proj.T
+/// ```
+pub fn mlp(x: &Array2<f32>, layer: &LayerWeights) -> Array2<f32> {
+    let gate = linear(x, &layer.gate_proj_weight, None).mapv(silu);
+    let up = linear(x, &layer.up_proj_weight, None);
+    let hidden = gate * up;
+    linear(&hidden, &layer.down_proj_weight, None)
+}
+
+// ---------------------------------------------------------------------------
+// Full forward pass
+// ---------------------------------------------------------------------------
+
+/// Run the full Qwen2 transformer on a batch of new tokens.
+///
+/// # Arguments
+/// * `tokens`    — token IDs to process (full prompt for prefill; a single
+///                 new token for each subsequent decode step)
+/// * `weights`   — model weights (read-only)
+/// * `rope`      — precomputed RoPE tables
+/// * `state`     — mutable KV-cache state; updated in-place
+/// * `cfg`       — model configuration
+///
+/// # Returns
+/// Logits for the **last** token position, shape `[vocab_size]`.
+pub fn forward(
+    tokens: &[u32],
+    weights: &Weights,
+    rope: &RopeCache,
+    state: &mut InferenceState,
+    cfg: &ModelConfig,
+) -> Array1<f32> {
+    let seq = tokens.len();
+    let start_pos = state.kv_caches[0].k.dim().0; // tokens already cached
+
+    // Embedding lookup -------------------------------------------------
+    let mut x = Array2::<f32>::zeros((seq, cfg.hidden_size));
+    for (i, &tok) in tokens.iter().enumerate() {
+        x.row_mut(i)
+            .assign(&weights.embed_tokens.row(tok as usize));
+    }
+
+    // Transformer layers -----------------------------------------------
+    for (li, layer) in weights.layers.iter().enumerate() {
+        let eps = cfg.rms_norm_eps as f32;
+
+        // Pre-attention norm
+        let normed = rms_norm_2d(&x, layer.input_layernorm.view(), eps);
+
+        // GQA attention
+        let attn_out = attention(
+            &normed,
+            layer,
+            rope,
+            &mut state.kv_caches[li],
+            start_pos,
+            cfg,
+        );
+        x = x + attn_out;
+
+        // Pre-MLP norm
+        let normed2 = rms_norm_2d(&x, layer.post_attention_layernorm.view(), eps);
+
+        // SwiGLU MLP
+        let mlp_out = mlp(&normed2, layer);
+        x = x + mlp_out;
+    }
+
+    // Final norm -------------------------------------------------------
+    let x_normed = rms_norm_2d(&x, weights.norm.view(), cfg.rms_norm_eps as f32);
+
+    // LM head (weight tied to embed_tokens): hidden @ embed_tokens.T
+    // embed_tokens: [vocab, hidden]; last_row: [hidden]
+    // → [vocab, hidden] @ [hidden] = [vocab]
+    let last_row = x_normed.row(seq - 1).to_owned();
+    weights.embed_tokens.dot(&last_row)
 }
 
 // ---------------------------------------------------------------------------
