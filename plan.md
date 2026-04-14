@@ -24,7 +24,7 @@ src/
 3. **Parse the model config** (`config.rs`) ✓
    Deserialise `config.json` into a `ModelConfig` struct using serde. Key fields: `vocab_size`, `hidden_size`, `intermediate_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads` (for GQA), `max_position_embeddings`, `rms_norm_eps`, `rope_theta`. This struct is passed to every other module so dimensions are consistent.
 
-4. **Implement a safetensors parser from scratch** (`safetensors.rs`)
+4. **Implement a safetensors parser from scratch** (`safetensors.rs`) ✓
    The safetensors format starts with a little-endian u64 giving the header length, followed by a JSON header mapping tensor names to `{dtype, shape, data_offsets}`, followed by the raw tensor bytes. Parse the header with `serde_json`, then for each tensor slice the byte buffer at `data_offsets`, reinterpret the bytes as `f32` (casting from the bf16 or f16 on-disk dtype if needed), and reshape into an `ndarray::ArrayD<f32>`. Build a `Weights` struct with named fields (`embed_tokens`, per-layer `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`, `input_layernorm`, `post_attention_layernorm`, `norm`, `lm_head`) so the transformer code can access them by name.
 
 5. **Implement a BPE tokenizer from scratch** (`tokenizer.rs`)
