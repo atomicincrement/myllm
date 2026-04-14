@@ -21,7 +21,7 @@ src/
 2. **Fetch the Qwen model files over HTTP** (`download.rs`) ✓
    Download `config.json`, `tokenizer.json`, `tokenizer_config.json`, and `model.safetensors` (or sharded `model-00001-of-NNNNN.safetensors` files) from the Hugging Face Hub using reqwest. Cache files to a local directory so they are not re-downloaded on subsequent runs. Verify file sizes / checksums against the Hub metadata.
 
-3. **Parse the model config** (`config.rs`)
+3. **Parse the model config** (`config.rs`) ✓
    Deserialise `config.json` into a `ModelConfig` struct using serde. Key fields: `vocab_size`, `hidden_size`, `intermediate_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads` (for GQA), `max_position_embeddings`, `rms_norm_eps`, `rope_theta`. This struct is passed to every other module so dimensions are consistent.
 
 4. **Implement a safetensors parser from scratch** (`safetensors.rs`)
