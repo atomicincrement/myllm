@@ -18,7 +18,7 @@ src/
 1. **Add dependencies to Cargo.toml** ✓
    `ndarray` (n-dimensional arrays), `reqwest` (HTTP, blocking + rustls features), `serde`/`serde_json` (JSON deserialisation), `anyhow` (error handling). The safetensors parser and BPE tokenizer are implemented from scratch with no external crates.
 
-2. **Fetch the Qwen model files over HTTP** (`download.rs`)
+2. **Fetch the Qwen model files over HTTP** (`download.rs`) ✓
    Download `config.json`, `tokenizer.json`, `tokenizer_config.json`, and `model.safetensors` (or sharded `model-00001-of-NNNNN.safetensors` files) from the Hugging Face Hub using reqwest. Cache files to a local directory so they are not re-downloaded on subsequent runs. Verify file sizes / checksums against the Hub metadata.
 
 3. **Parse the model config** (`config.rs`)
